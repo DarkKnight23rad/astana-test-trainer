@@ -137,6 +137,51 @@
       .top, main, .toolbar { grid-template-columns: 1fr; }
       .pills { justify-content: flex-start; }
     }
+
+    /* astana-exam-mode-v1 */
+    .exam-panel {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin: 12px 0;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+    .exam-start { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 700; }
+    button:disabled, input:disabled, select:disabled { opacity: .48; cursor: not-allowed; }
+    .exam-status { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; width: 100%; }
+    .exam-timer {
+      min-width: 104px;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #f6f8f9;
+      font-variant-numeric: tabular-nums;
+      font-weight: 800;
+      text-align: center;
+    }
+    .exam-timer.warning { border-color: var(--bad); color: var(--bad); background: #fef3f2; }
+    .exam-answered { color: var(--muted); font-weight: 700; }
+    .exam-finish { margin-left: auto; border-color: var(--bad); color: var(--bad); font-weight: 700; }
+    .exam-result {
+      margin: 12px 0;
+      padding: 14px;
+      border: 1px solid var(--accent);
+      border-left-width: 4px;
+      border-radius: 8px;
+      background: #f3faf8;
+      line-height: 1.5;
+    }
+    .exam-result strong { display: block; margin-bottom: 4px; font-size: 18px; }
+    .exam-result span { color: var(--muted); }
+    @media (max-width: 640px) {
+      .exam-panel, .exam-status { align-items: stretch; flex-direction: column; }
+      .exam-panel button, .exam-finish { width: 100%; margin-left: 0; }
+      .exam-timer { width: 100%; }
+    }
   </style>
 </head>
 <body>
@@ -156,6 +201,16 @@
         <button id="shuffle">Перемешать</button>
         <button id="reset">Сброс</button>
       </div>
+      <!-- astana-exam-mode-v1 -->
+      <div class="exam-panel" id="examPanel">
+        <button class="exam-start" id="startExam" type="button">Экзамен: 100 вопросов · 2:30</button>
+        <div class="exam-status" id="examStatus" hidden>
+          <span class="exam-timer" id="examTimer">02:30:00</span>
+          <span class="exam-answered" id="examAnswered">Отвечено 0 / 100</span>
+          <button class="exam-finish" id="finishExam" type="button">Завершить экзамен</button>
+        </div>
+      </div>
+      <div class="exam-result" id="examResult" hidden></div>
       <article class="quiz">
         <div class="meta"><span id="pos"></span><span>тест Астана.docx</span></div>
         <p class="question" id="question"></p>
@@ -302,7 +357,188 @@
     $("shuffle").onclick = () => { shuffleArray(order); index = 0; render(); };
     $("reset").onclick = () => { progress = {}; save(); render(); };
     $("search").oninput = rebuild;
+
+    // astana-exam-mode-v1
+    const examStorageKey = "astanaExamStateV1";
+    const examDurationMs = 150 * 60 * 1000;
+    const examQuestionCount = 100;
+    const examUsesCurrent = Boolean(document.getElementById("position"));
+    const examPositionElement = () => document.getElementById(examUsesCurrent ? "position" : "pos");
+    const examGetCurrent = () => examUsesCurrent ? current : index;
+    const examSetCurrent = value => { if (examUsesCurrent) current = value; else index = value; };
+    let examTimerHandle = null;
+    let examState = (() => {
+      try { return JSON.parse(localStorage.getItem(examStorageKey) || "null"); }
+      catch (_) { return null; }
+    })();
+    let examInitialized = false;
+
+    function examSave() {
+      localStorage.setItem(examStorageKey, JSON.stringify(examState));
+    }
+
+    function examUsableIndexes() {
+      return cards.map((card, cardIndex) => [card, cardIndex]).filter(([card]) =>
+        Array.isArray(card.options)
+        && card.options.length >= 2
+        && Number.isInteger(card.correct_index)
+        && card.correct_index >= 0
+        && card.correct_index < card.options.length
+        && Boolean(card.answer)
+      ).map(([, cardIndex]) => cardIndex);
+    }
+
+    function examFormatDuration(milliseconds) {
+      const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
+      const hours = Math.floor(totalSeconds / 3600);
+      const minutes = Math.floor((totalSeconds % 3600) / 60);
+      const seconds = totalSeconds % 60;
+      return [hours, minutes, seconds].map(value => String(value).padStart(2, "0")).join(":");
+    }
+
+    function examAnsweredCount() {
+      return examState?.answers ? Object.keys(examState.answers).length : 0;
+    }
+
+    function examRenderResult() {
+      const panel = $("examResult");
+      const result = examState?.result;
+      panel.hidden = !result;
+      if (!result) { panel.replaceChildren(); return; }
+      const title = document.createElement("strong");
+      title.textContent = `Результат экзамена: ${result.correct} / ${examQuestionCount} (${result.correct}%)`;
+      const details = document.createElement("span");
+      details.textContent = `Ошибок: ${result.incorrect} · Без ответа: ${result.unanswered} · Время: ${examFormatDuration(result.elapsedMs)}${result.timedOut ? " · Время истекло" : ""}`;
+      panel.replaceChildren(title, details);
+    }
+
+    function examApplyControls() {
+      const active = Boolean(examState?.active);
+      $("startExam").hidden = active;
+      $("examStatus").hidden = !active;
+      ["search", "filter", "shuffle", "reset", "show"].forEach(id => {
+        const control = document.getElementById(id);
+        if (control) control.disabled = active;
+      });
+      examRenderResult();
+      if (active) examTick();
+    }
+
+    function examTick() {
+      if (!examState?.active) return;
+      const remaining = examState.deadline - Date.now();
+      if (remaining <= 0) { examFinish(true); return; }
+      $("examTimer").textContent = examFormatDuration(remaining);
+      $("examTimer").classList.toggle("warning", remaining <= 10 * 60 * 1000);
+      $("examAnswered").textContent = `Отвечено ${examAnsweredCount()} / ${examQuestionCount}`;
+    }
+
+    function examStart() {
+      const pool = examUsableIndexes();
+      if (pool.length < examQuestionCount) {
+        alert(`Недостаточно вопросов с отмеченным правильным ответом: ${pool.length}`);
+        return;
+      }
+      shuffleArray(pool);
+      const now = Date.now();
+      examState = {
+        active: true,
+        order: pool.slice(0, examQuestionCount),
+        answers: {},
+        current: 0,
+        startedAt: now,
+        deadline: now + examDurationMs,
+        result: null,
+      };
+      order = [...examState.order];
+      examSetCurrent(0);
+      examSave();
+      examApplyControls();
+      render();
+      clearInterval(examTimerHandle);
+      examTimerHandle = setInterval(examTick, 1000);
+    }
+
+    function examFinish(timedOut = false) {
+      if (!examState?.active) return;
+      if (!timedOut && !confirm("Завершить экзамен и показать результат?")) return;
+      clearInterval(examTimerHandle);
+      const answered = examAnsweredCount();
+      let correct = 0;
+      examState.order.forEach(cardIndex => {
+        const card = cards[cardIndex];
+        if (Number(examState.answers[card.id]) === card.correct_index) correct += 1;
+      });
+      const finishedAt = Date.now();
+      examState = {
+        active: false,
+        result: {
+          correct,
+          incorrect: answered - correct,
+          unanswered: examQuestionCount - answered,
+          elapsedMs: Math.min(examDurationMs, finishedAt - examState.startedAt),
+          timedOut,
+          finishedAt,
+        },
+      };
+      examSave();
+      examApplyControls();
+      rebuild();
+      $("examResult").scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+
+    const examPracticeRender = render;
+    render = function() {
+      examPracticeRender();
+      if (!examInitialized || !examState?.active || !order.length) return;
+      const pointer = examGetCurrent();
+      examState.current = pointer;
+      examSave();
+      const card = cards[order[pointer]];
+      examPositionElement().textContent = `Экзамен · ${pointer + 1} / ${examQuestionCount}`;
+      const selected = examState.answers[card.id];
+      [...document.querySelectorAll(".answer")].forEach((button, optionIndex) => {
+        button.classList.toggle("selected", Number(selected) === optionIndex);
+      });
+      $("feedback").textContent = selected === undefined ? "Выберите один ответ" : "Ответ сохранён";
+      $("feedback").className = "feedback";
+      examTick();
+    };
+
+    const examPracticeChoose = choose;
+    choose = function(optionIndex) {
+      if (!examState?.active) { examPracticeChoose(optionIndex); return; }
+      const card = cards[order[examGetCurrent()]];
+      examState.answers[card.id] = optionIndex;
+      examSave();
+      render();
+    };
+
+    const examPracticeShow = $("show").onclick;
+    $("show").onclick = () => {
+      if (examState?.active) return;
+      examPracticeShow();
+    };
+    $("startExam").onclick = examStart;
+    $("finishExam").onclick = () => examFinish(false);
+
+    function examInit() {
+      examRenderResult();
+      if (!examState?.active) { examInitialized = true; examApplyControls(); return; }
+      const validOrder = Array.isArray(examState.order) && examState.order.length === examQuestionCount;
+      if (!validOrder) { examState = null; examInitialized = true; localStorage.removeItem(examStorageKey); examApplyControls(); return; }
+      if (examState.deadline <= Date.now()) { examInitialized = true; examFinish(true); return; }
+      order = [...examState.order];
+      examSetCurrent(Math.min(examState.current || 0, examQuestionCount - 1));
+      examInitialized = true;
+      examApplyControls();
+      render();
+      clearInterval(examTimerHandle);
+      examTimerHandle = setInterval(examTick, 1000);
+    }
+
     rebuild();
+    examInit();
   </script>
 </body>
 </html>
